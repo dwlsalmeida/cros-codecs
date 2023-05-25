@@ -288,7 +288,7 @@ impl Decoder<VADecodedHandle> {
     // Creates a new instance of the decoder using the VAAPI backend.
     pub fn new_vaapi(display: Rc<Display>, blocking_mode: BlockingMode) -> anyhow::Result<Self> {
         Self::new(
-            Box::new(VaapiBackend::<Header>::new(display)),
+            Box::new(VaapiBackend::<Header>::new(display, true)),
             blocking_mode,
         )
     }
