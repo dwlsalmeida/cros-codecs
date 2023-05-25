@@ -574,7 +574,10 @@ impl StatelessDecoderBackend for VaapiBackend<Sps> {
 impl Decoder<VADecodedHandle, VaPicture<PictureNew>> {
     // Creates a new instance of the decoder using the VAAPI backend.
     pub fn new_vaapi(display: Rc<Display>, blocking_mode: BlockingMode) -> anyhow::Result<Self> {
-        Self::new(Box::new(VaapiBackend::<Sps>::new(display)), blocking_mode)
+        Self::new(
+            Box::new(VaapiBackend::<Sps>::new(display, false)),
+            blocking_mode,
+        )
     }
 }
 

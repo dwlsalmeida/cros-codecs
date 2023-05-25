@@ -343,18 +343,11 @@ impl StreamMetadataState {
         display: &Rc<Display>,
         hdr: S,
         format_map: Option<&FormatMap>,
+        supports_context_reuse: SupportsContextReuse,
     ) -> anyhow::Result<StreamMetadataState> {
         let va_profile = hdr.va_profile()?;
         let rt_format = hdr.rt_format()?;
         let (frame_w, frame_h) = hdr.coded_size();
-
-        let attrs = vec![libva::VAConfigAttrib {
-            type_: libva::VAConfigAttribType::VAConfigAttribRTFormat,
-            value: rt_format,
-        }];
-
-        let config =
-            display.create_config(attrs, va_profile, libva::VAEntrypoint::VAEntrypointVLD)?;
 
         let format_map = if let Some(format_map) = format_map {
             format_map
@@ -380,25 +373,6 @@ impl StreamMetadataState {
 
         let min_num_surfaces = hdr.min_num_surfaces();
 
-        let surfaces = display.create_surfaces(
-            rt_format,
-            // Let the hardware decide the best internal format - we will get the desired fourcc
-            // when creating the image.
-            None,
-            frame_w,
-            frame_h,
-            Some(libva::UsageHint::USAGE_HINT_DECODER),
-            min_num_surfaces as u32,
-        )?;
-
-        let context = display.create_context(
-            &config,
-            i32::try_from(frame_w)?,
-            i32::try_from(frame_h)?,
-            Some(&surfaces),
-            true,
-        )?;
-
         let coded_resolution = Resolution {
             width: frame_w,
             height: frame_h,
@@ -411,8 +385,78 @@ impl StreamMetadataState {
             height: visible_rect.1 .1 - visible_rect.0 .1,
         };
 
-        let surface_pool = SurfacePoolHandle::new(surfaces, coded_resolution);
+        let (create_new_context, create_new_surfaces) =
+            if let SupportsContextReuse::Yes(StreamMetadataState::Parsed(ParsedStreamMetadata {
+                ref surface_pool,
+                min_num_surfaces: old_min_num_surfaces,
+                rt_format: old_rt_format,
+                profile: old_profile,
+                ..
+            })) = supports_context_reuse
+            {
+                // TODO: Unsure whether create_new_context mandates creating new
+                // surfaces. Be conservative for now, but test that in the
+                // future.
+                let create_new_context = va_profile != old_profile || rt_format != old_rt_format;
+                let create_new_surfaces = create_new_context
+                    || min_num_surfaces > old_min_num_surfaces
+                    || !coded_resolution.fits(surface_pool.coded_resolution());
 
+                (create_new_context, create_new_surfaces)
+            } else {
+                (true, true)
+            };
+
+        let (config, context, mut surface_pool) = if create_new_context {
+            let attrs = vec![libva::VAConfigAttrib {
+                type_: libva::VAConfigAttribType::VAConfigAttribRTFormat,
+                value: rt_format,
+            }];
+
+            let config =
+                display.create_config(attrs, va_profile, libva::VAEntrypoint::VAEntrypointVLD)?;
+
+            let context = display.create_context(
+                &config,
+                i32::try_from(frame_w)?,
+                i32::try_from(frame_h)?,
+                None,
+                true,
+            )?;
+
+            let surface_pool = SurfacePoolHandle::new(vec![], coded_resolution);
+
+            (config, context, surface_pool)
+        } else {
+            match supports_context_reuse {
+                SupportsContextReuse::Yes(StreamMetadataState::Parsed(ParsedStreamMetadata {
+                    context,
+                    config,
+                    surface_pool,
+                    ..
+                })) => (config, context, surface_pool),
+                _ => unreachable!(),
+            }
+        };
+
+        if create_new_surfaces {
+            let surfaces = display.create_surfaces(
+                rt_format,
+                // Let the hardware decide the best internal format - we will get the desired fourcc
+                // when creating the image.
+                None,
+                frame_w,
+                frame_h,
+                Some(libva::UsageHint::USAGE_HINT_DECODER),
+                min_num_surfaces as u32,
+            )?;
+
+            surface_pool.set_coded_resolution(coded_resolution);
+
+            for surface in surfaces {
+                surface_pool.add_surface(surface).map_err(|e| e.1)?;
+            }
+        }
         Ok(StreamMetadataState::Parsed(ParsedStreamMetadata {
             context,
             config,
@@ -687,6 +731,11 @@ impl TryFrom<&libva::VAImageFormat> for DecodedFormat {
     }
 }
 
+enum SupportsContextReuse {
+    No,
+    Yes(StreamMetadataState),
+}
+
 pub(crate) struct VaapiBackend<StreamData>
 where
     for<'a> &'a StreamData: StreamInfo,
@@ -695,6 +744,9 @@ where
     display: Rc<Display>,
     /// The metadata state. Updated whenever the decoder reads new data from the stream.
     pub(crate) metadata_state: StreamMetadataState,
+    /// Whether we support reusing old contexts after DRC. This depends on the
+    /// codec in use.
+    supports_context_reuse: bool,
     /// Make sure the backend is typed by stream information provider.
     _stream_data: PhantomData<StreamData>,
 }
@@ -704,10 +756,11 @@ where
     StreamData: Clone,
     for<'a> &'a StreamData: StreamInfo,
 {
-    pub(crate) fn new(display: Rc<libva::Display>) -> Self {
+    pub(crate) fn new(display: Rc<libva::Display>, supports_context_reuse: bool) -> Self {
         Self {
             display,
             metadata_state: StreamMetadataState::Unparsed,
+            supports_context_reuse,
             _stream_data: PhantomData,
         }
     }
@@ -716,7 +769,16 @@ where
         &mut self,
         stream_params: &StreamData,
     ) -> StatelessBackendResult<()> {
-        self.metadata_state = StreamMetadataState::open(&self.display, stream_params, None)?;
+        let supports_context_reuse = match self.supports_context_reuse {
+            true => SupportsContextReuse::Yes(std::mem::replace(
+                &mut self.metadata_state,
+                StreamMetadataState::Unparsed,
+            )),
+            false => SupportsContextReuse::No,
+        };
+
+        self.metadata_state =
+            StreamMetadataState::open(&self.display, stream_params, None, supports_context_reuse)?;
 
         Ok(())
     }
@@ -815,8 +877,21 @@ where
                     )
                 })?;
 
-            self.metadata_state =
-                StreamMetadataState::open(&self.display, format_info, Some(map_format))?;
+            let supports_context_reuse = match self.supports_context_reuse {
+                true => SupportsContextReuse::Yes(std::mem::replace(
+                    &mut self.metadata_state,
+                    StreamMetadataState::Unparsed,
+                )),
+                false => SupportsContextReuse::No,
+            };
+
+            self.metadata_state = StreamMetadataState::open(
+                &self.display,
+                format_info,
+                Some(map_format),
+                supports_context_reuse,
+            )?;
+
             Ok(())
         } else {
             Err(VideoDecoderError::StatelessBackendError(
