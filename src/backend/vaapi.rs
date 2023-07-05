@@ -569,9 +569,13 @@ impl StreamMetadataState {
 
         let visible_rect = hdr.visible_rect();
 
+        // let display_resolution = Resolution {
+        //     width: visible_rect.1 .0 - visible_rect.0 .0,
+        //     height: visible_rect.1 .1 - visible_rect.0 .1,
+        // };
         let display_resolution = Resolution {
-            width: visible_rect.1 .0 - visible_rect.0 .0,
-            height: visible_rect.1 .1 - visible_rect.0 .1,
+            width: visible_rect.1 .0,
+            height: visible_rect.1 .1,
         };
 
         let (config, context, surface_pool) = match old_metadata_state {

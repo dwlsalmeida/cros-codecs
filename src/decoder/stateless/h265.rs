@@ -54,6 +54,52 @@ pub(crate) fn clip3(x: i32, y: i32, z: i32) -> i32 {
     }
 }
 
+// See 6.5.3
+const fn up_right_diagonal<const N: usize, const ROWS: usize>() -> [usize; N] {
+    // Generics can't be used in const operations for now, so [0; ROWS * ROWS]
+    // is rejected by the compiler
+    assert!(ROWS * ROWS == N);
+
+    let mut i = 0;
+    let mut x = 0i32;
+    let mut y = 0i32;
+    let mut ret = [0; N];
+
+    loop {
+        while y >= 0 {
+            if x < (ROWS as i32) && y < (ROWS as i32) {
+                ret[i] = (x + ROWS as i32 * y) as usize;
+                i += 1;
+            }
+            y -= 1;
+            x += 1;
+        }
+
+        y = x;
+        x = 0;
+        if i >= N {
+            break;
+        }
+    }
+
+    ret
+}
+
+const UP_RIGHT_DIAGONAL_4X4: [usize; 16] = up_right_diagonal::<16, 4>();
+const UP_RIGHT_DIAGONAL_8X8: [usize; 64] = up_right_diagonal::<64, 8>();
+
+fn get_raster_from_up_right_diagonal_8x8(src: [u8; 64], dst: &mut [u8; 64]) {
+    for i in 0..64 {
+        dst[UP_RIGHT_DIAGONAL_8X8[i]] = src[i];
+    }
+}
+
+fn get_raster_from_up_right_diagonal_4x4(src: [u8; 16], dst: &mut [u8; 16]) {
+    for i in 0..16 {
+        dst[UP_RIGHT_DIAGONAL_4X4[i]] = src[i];
+    }
+}
+
 /// Stateless backend methods specific to H.265.
 trait StatelessH265DecoderBackend: StatelessDecoderBackend<Sps> {
     /// Called when a new SPS is parsed.
@@ -227,15 +273,19 @@ where
     /// The current picture representation on the backend side.
     cur_backend_pic: Option<P>,
 
-    // Used to identify first picture in decoding order or first picture that
-    // follows an EOS NALU.
-    is_first_picture_in_au: bool,
+    /// Used to identify first picture in decoding order or first picture that
+    /// follows an EOS NALU.
+    first_picture_after_eos: bool,
 
+    /// Whether this is the first picture in the bitstream in decoding order.
+    first_picture_in_bitstream: bool,
     // Same as PrevTid0Pic in the specification.
     prev_tid_0_pic: Option<PictureData>,
 
     // Internal variables needed during the decoding process.
     max_pic_order_cnt_lsb: i32,
+    /// The value of NoRaslOutputFlag for the last IRAP picture.
+    irap_no_rasl_output_flag: bool,
 
     /// Reference picture list 0 for P and B slices. Retains the same meaning as
     /// in the specification. Points into the pictures stored in the DPB.
@@ -264,7 +314,8 @@ where
         Ok(Self {
             backend,
             blocking_mode,
-            is_first_picture_in_au: true,
+            first_picture_after_eos: true,
+            first_picture_in_bitstream: true,
             parser: Default::default(),
             decoding_state: Default::default(),
             negotiation_info: Default::default(),
@@ -275,6 +326,7 @@ where
             cur_pic: Default::default(),
             prev_tid_0_pic: Default::default(),
             max_pic_order_cnt_lsb: Default::default(),
+            irap_no_rasl_output_flag: Default::default(),
             ref_pic_list0: Default::default(),
             ref_pic_list1: Default::default(),
             cur_backend_pic: Default::default(),
@@ -296,13 +348,13 @@ where
         *old_negotiation_info != negotiation_info || prev_max_dpb_size != max_dpb_size
     }
 
-    fn peek_sps(parser: &mut Parser, bitstream: &[u8]) -> anyhow::Result<Option<Sps>> {
+    fn peek_sps(bitstream: &[u8]) -> anyhow::Result<Option<Sps>> {
         let mut cursor = Cursor::new(bitstream);
 
         while let Ok(nalu) = Nalu::next(&mut cursor) {
             if matches!(nalu.header().type_(), NaluType::SpsNut) {
-                let sps = parser.parse_sps(&nalu)?;
-                return Ok(Some(sps.clone()));
+                let sps = Parser::peek_sps(&nalu)?;
+                return Ok(Some(sps));
             }
         }
 
@@ -332,7 +384,7 @@ where
         let hdr = slice.header();
         let cur_pic = self.cur_pic.as_ref().unwrap();
 
-        if cur_pic.nal_unit_type.is_irap() && cur_pic.no_rasl_output_flag {
+        if cur_pic.nalu_type.is_irap() && cur_pic.no_rasl_output_flag {
             self.dpb.mark_all_as_unused_for_ref();
         }
 
@@ -444,46 +496,90 @@ where
         // Equation 8-6
         for i in 0..self.rps.num_poc_lt_curr {
             if !self.rps.curr_delta_poc_msb_present_flag[i] {
-                let poc = self.rps.poc_lt_curr[i] & (max_pic_order_cnt_lsb - 1);
-                self.rps.ref_pic_set_lt_curr[i] = self.dpb.find_ref_by_poc(poc);
+                let poc = self.rps.poc_lt_curr[i];
+                let mask = max_pic_order_cnt_lsb - 1;
+                let reference = self.dpb.find_ref_by_poc_masked(poc, mask);
+
+                if reference.is_none() {
+                    log::warn!("No reference found for poc {} and mask {}", poc, mask);
+                }
+
+                self.rps.ref_pic_set_lt_curr[i] = reference;
             } else {
                 let poc = self.rps.poc_lt_curr[i];
-                self.rps.ref_pic_set_lt_curr[i] = self.dpb.find_ref_by_poc(poc);
+                let reference = self.dpb.find_ref_by_poc(poc);
+
+                if reference.is_none() {
+                    log::warn!("No reference found for poc {}", poc);
+                }
+
+                self.rps.ref_pic_set_lt_curr[i] = reference;
             }
         }
 
         for i in 0..self.rps.num_poc_lt_foll {
             if !self.rps.foll_delta_poc_msb_present_flag[i] {
-                let poc = self.rps.poc_lt_foll[i] & (max_pic_order_cnt_lsb - 1);
-                self.rps.ref_pic_set_lt_foll[i] = self.dpb.find_ref_by_poc(poc);
+                let poc = self.rps.poc_lt_foll[i];
+                let mask = max_pic_order_cnt_lsb - 1;
+                let reference = self.dpb.find_ref_by_poc_masked(poc, mask);
+
+                if reference.is_none() {
+                    log::warn!("No reference found for poc {} and mask {}", poc, mask);
+                }
+
+                self.rps.ref_pic_set_lt_foll[i] = reference;
             } else {
                 let poc = self.rps.poc_lt_foll[i];
-                self.rps.ref_pic_set_lt_foll[i] = self.dpb.find_ref_by_poc(poc);
+                let reference = self.dpb.find_ref_by_poc(poc);
+
+                if reference.is_none() {
+                    log::warn!("No reference found for poc {}", poc);
+                }
+
+                self.rps.ref_pic_set_lt_foll[i] = reference;
             }
         }
 
         for pic in self.rps.ref_pic_set_lt_curr.iter().flatten() {
-            pic.0.borrow_mut().reference = Reference::LongTerm;
+            pic.0.borrow_mut().set_reference(Reference::LongTerm);
         }
 
         for pic in self.rps.ref_pic_set_lt_foll.iter().flatten() {
-            pic.0.borrow_mut().reference = Reference::LongTerm;
+            pic.0.borrow_mut().set_reference(Reference::LongTerm);
         }
 
         // Equation 8-7
         for i in 0..self.rps.num_poc_st_curr_before {
             let poc = self.rps.poc_st_curr_before[i];
-            self.rps.ref_pic_set_st_curr_before[i] = self.dpb.find_short_term_ref_by_poc(poc);
+            let reference = self.dpb.find_short_term_ref_by_poc(poc);
+
+            if reference.is_none() {
+                log::warn!("No reference found for poc {}", poc);
+            }
+
+            self.rps.ref_pic_set_st_curr_before[i] = reference;
         }
 
         for i in 0..self.rps.num_poc_st_curr_after {
             let poc = self.rps.poc_st_curr_after[i];
-            self.rps.ref_pic_set_st_curr_after[i] = self.dpb.find_short_term_ref_by_poc(poc);
+            let reference = self.dpb.find_short_term_ref_by_poc(poc);
+
+            if reference.is_none() {
+                log::warn!("No reference found for poc {}", poc);
+            }
+
+            self.rps.ref_pic_set_st_curr_after[i] = reference;
         }
 
         for i in 0..self.rps.num_poc_st_foll {
             let poc = self.rps.poc_st_foll[i];
-            self.rps.ref_pic_set_st_foll[i] = self.dpb.find_short_term_ref_by_poc(poc);
+            let reference = self.dpb.find_short_term_ref_by_poc(poc);
+
+            if reference.is_none() {
+                log::warn!("No reference found for poc {}", poc);
+            }
+
+            self.rps.ref_pic_set_st_foll[i] = reference;
         }
 
         // 4. All reference pictures in the DPB that are not included in
@@ -496,29 +592,31 @@ where
                 None => false,
             };
 
-            if !self.rps.ref_pic_set_lt_curr.iter().any(find_predicate)
-                && !self.rps.ref_pic_set_lt_foll.iter().any(find_predicate)
-                && !self
-                    .rps
-                    .ref_pic_set_st_curr_after
+            if !self.rps.ref_pic_set_lt_curr[0..self.rps.num_poc_lt_curr]
+                .iter()
+                .any(find_predicate)
+                && !self.rps.ref_pic_set_lt_foll[0..self.rps.num_poc_lt_foll]
                     .iter()
                     .any(find_predicate)
-                && !self
-                    .rps
-                    .ref_pic_set_st_curr_before
+                && !self.rps.ref_pic_set_st_curr_after[0..self.rps.num_poc_st_curr_after]
                     .iter()
                     .any(find_predicate)
-                && !self.rps.ref_pic_set_st_foll.iter().any(find_predicate)
+                && !self.rps.ref_pic_set_st_curr_before[0..self.rps.num_poc_st_curr_before]
+                    .iter()
+                    .any(find_predicate)
+                && !self.rps.ref_pic_set_st_foll[0..self.rps.num_poc_st_foll]
+                    .iter()
+                    .any(find_predicate)
             {
-                dpb_pic.0.borrow_mut().reference = Reference::None;
+                dpb_pic.0.borrow_mut().set_reference(Reference::None);
             }
         }
 
-        let total_rps_len = self.rps.ref_pic_set_lt_curr.iter().count()
-            + self.rps.ref_pic_set_lt_foll.iter().count()
-            + self.rps.ref_pic_set_st_curr_after.iter().count()
-            + self.rps.ref_pic_set_st_curr_before.iter().count()
-            + self.rps.ref_pic_set_st_foll.iter().count();
+        let total_rps_len = self.rps.ref_pic_set_lt_curr[0..self.rps.num_poc_lt_curr].len()
+            + self.rps.ref_pic_set_lt_foll[0..self.rps.num_poc_lt_foll].len()
+            + self.rps.ref_pic_set_st_curr_after[0..self.rps.num_poc_st_curr_after].len()
+            + self.rps.ref_pic_set_st_curr_before[0..self.rps.num_poc_st_curr_before].len()
+            + self.rps.ref_pic_set_st_foll[0..self.rps.num_poc_st_foll].len();
 
         if self.dpb.entries().len() != total_rps_len {
             log::warn!("A reference pic is in more than one RPS list. This is against the specification. See 8.3.2. NOTE 5")
@@ -541,6 +639,19 @@ where
             .parser
             .get_pps(hdr.pic_parameter_set_id())
             .context("Invalid PPS in build_ref_pic_lists")?;
+
+        if self.rps.num_poc_st_curr_before == 0
+            && self.rps.num_poc_st_curr_after == 0
+            && self.rps.num_poc_lt_curr == 0
+            && pps.scc_extension_flag()
+            && !pps.scc_extension().curr_pic_ref_enabled_flag()
+        {
+            // Let's try and keep going, if it is a broken stream then maybe it
+            // will sort itself out as we go. In any case, we must not loop
+            // infinitely here.
+            log::error!("Bug or broken stream: out of pictures and can't build ref pic lists.");
+            return Ok(());
+        }
 
         let cur_pic = self.cur_pic.as_ref().unwrap();
         let rplm = hdr.ref_pic_list_modification();
@@ -682,10 +793,23 @@ where
 
     /// Drain the decoder, processing all pending frames.
     fn drain(&mut self) {
+        log::debug!("Draining the decoder");
+
         let pics = self.dpb.drain();
 
-        self.ready_queue.extend(pics.into_iter().map(|h| h.1));
+        log::debug!(
+            "Adding POCs {:?} to the ready queue while draining",
+            pics.iter()
+                .map(|p| p.0.borrow().pic_order_cnt_val)
+                .collect::<Vec<_>>()
+        );
 
+        log::trace!(
+            "{:#?}",
+            pics.iter().map(|p| p.0.borrow()).collect::<Vec<_>>()
+        );
+
+        self.ready_queue.extend(pics.into_iter().map(|h| h.1));
         self.dpb.clear();
     }
 
@@ -731,7 +855,7 @@ where
     fn update_dpb_before_decoding(&mut self) -> anyhow::Result<()> {
         let cur_pic = self.cur_pic.as_ref().unwrap();
 
-        if cur_pic.is_irap && cur_pic.no_rasl_output_flag && !cur_pic.is_first_picture {
+        if cur_pic.is_irap && cur_pic.no_rasl_output_flag && !self.first_picture_after_eos {
             if cur_pic.no_output_of_prior_pics_flag {
                 self.dpb.clear();
             } else {
@@ -739,11 +863,22 @@ where
             }
         } else {
             self.dpb.remove_unused();
-            let bumped = self
-                .bump_as_needed(BumpingType::BeforeDecoding)?
-                .into_iter()
-                .map(|p| p.1)
-                .collect::<Vec<_>>();
+            let bumped = self.bump_as_needed(BumpingType::BeforeDecoding)?;
+
+            log::debug!(
+                "Adding POCs {:?} to the ready queue before decoding",
+                bumped
+                    .iter()
+                    .map(|p| p.0.borrow().pic_order_cnt_val)
+                    .collect::<Vec<_>>()
+            );
+
+            log::trace!(
+                "{:#?}",
+                bumped.iter().map(|p| p.0.borrow()).collect::<Vec<_>>()
+            );
+
+            let bumped = bumped.into_iter().map(|p| p.1).collect::<Vec<_>>();
             self.ready_queue.extend(bumped);
         }
 
@@ -769,14 +904,38 @@ where
         self.cur_pic = Some(PictureData::new_from_slice(
             slice,
             pps,
-            self.is_first_picture_in_au,
+            self.first_picture_in_bitstream,
+            self.first_picture_after_eos,
             prev_tid0,
             self.max_pic_order_cnt_lsb,
             timestamp,
         ));
 
+        self.first_picture_after_eos = false;
+        self.first_picture_in_bitstream = false;
+
         let cur_pic = self.cur_pic.as_ref().unwrap();
-        log::debug!("Decode picture POC {:?}", cur_pic.pic_order_cnt_val);
+
+        if cur_pic.is_irap {
+            self.irap_no_rasl_output_flag = cur_pic.no_rasl_output_flag;
+        } else if cur_pic.nalu_type.is_rasl() && self.irap_no_rasl_output_flag {
+            // NOTE – All RASL pictures are leading pictures of an associated
+            // BLA or CRA picture. When the associated IRAP picture has
+            // NoRaslOutputFlag equal to 1, the RASL picture is not output and
+            // may not be correctly decodable, as the RASL picture may contain
+            // references to pictures that are not present in the bitstream.
+            // RASL pictures are not used as reference pictures for the decoding
+            // process of non-RASL pictures.
+            log::debug!(
+                "Dropping POC {}, as it may not be decodable according to the specification",
+                cur_pic.pic_order_cnt_val
+            );
+
+            self.cur_pic = None;
+            return Ok(());
+        }
+
+        log::debug!("Decode picture POC {}", cur_pic.pic_order_cnt_val);
 
         self.decode_rps(slice)?;
         self.update_dpb_before_decoding()?;
@@ -834,14 +993,27 @@ where
 
         self.clear_ref_lists();
 
-        let bumped = self
-            .bump_as_needed(BumpingType::AfterDecoding)?
-            .into_iter()
-            .map(|p| p.1)
-            .collect::<Vec<_>>();
+        // First store the current picture in the DPB, only then we should
+        // decide whether to bump.
+        self.dpb.store_picture(Rc::new(RefCell::new(pic)), handle)?;
+        let bumped = self.bump_as_needed(BumpingType::AfterDecoding)?;
+
+        log::debug!(
+            "Adding POCs {:?} to the ready queue after decoding",
+            bumped
+                .iter()
+                .map(|p| p.0.borrow().pic_order_cnt_val)
+                .collect::<Vec<_>>()
+        );
+
+        log::trace!(
+            "{:#?}",
+            bumped.iter().map(|p| p.0.borrow()).collect::<Vec<_>>()
+        );
+
+        let bumped = bumped.into_iter().map(|p| p.1).collect::<Vec<_>>();
         self.ready_queue.extend(bumped);
 
-        self.dpb.store_picture(Rc::new(RefCell::new(pic)), handle)?;
         Ok(())
     }
 
@@ -862,7 +1034,8 @@ where
                     self.parser.parse_vps(&nalu)?;
                 }
                 NaluType::SpsNut => {
-                    self.parser.parse_sps(&nalu)?;
+                    let sps = self.parser.parse_sps(&nalu)?;
+                    self.max_pic_order_cnt_lsb = 1 << (sps.log2_max_pic_order_cnt_lsb_minus4() + 4);
                 }
 
                 NaluType::PpsNut => {
@@ -885,13 +1058,6 @@ where
                 | NaluType::RaslN
                 | NaluType::RaslR
                 | NaluType::CraNut => {
-                    if matches!(self.decoding_state, DecodingState::AwaitingFormat(_)) {
-                        // If we have a forced a renegotiation when processing a
-                        // dependent slice, skip any further slices of this picture.
-                        // TODO: How are we giving back the NALUs so that the client can retry?
-                        continue;
-                    }
-
                     let mut slice = self.parser.parse_slice_header(nalu)?;
 
                     let first_slice_segment_in_pic_flag =
@@ -950,20 +1116,31 @@ where
                         self.handle_picture(timestamp, &slice)?;
                     }
 
-                    self.handle_slice(timestamp, &slice)?;
+                    if self.cur_pic.is_some() {
+                        // Picture may have been dropped during handle_picture()
+                        self.handle_slice(timestamp, &slice)?;
+                    }
                 }
 
                 NaluType::EosNut => {
-                    self.is_first_picture_in_au = true;
+                    self.first_picture_after_eos = true;
                 }
+
+                NaluType::EobNut => {
+                    self.first_picture_in_bitstream = true;
+                }
+
                 other => {
                     log::debug!("Unsupported NAL unit type {:?}", other,);
                 }
             }
         }
 
-        let (picture, handle) = self.submit_picture()?;
-        self.finish_picture(picture, handle)?;
+        // TODO: this should be refactored as per #facd6fa
+        if self.cur_pic.is_some() {
+            let (picture, handle) = self.submit_picture()?;
+            self.finish_picture(picture, handle)?;
+        }
 
         Ok(bitstream.len())
     }
@@ -989,7 +1166,8 @@ where
     T: DecodedHandle + Clone + 'static,
 {
     fn decode(&mut self, timestamp: u64, mut bitstream: &[u8]) -> Result<usize, DecodeError> {
-        let sps = Self::peek_sps(&mut self.parser, bitstream)?;
+        // let sps = Self::peek_sps(&mut self.parser, bitstream)?;
+        let sps = None;
 
         if let Some(sps) = sps {
             if Self::negotiation_possible(&sps, &self.dpb, &self.negotiation_info) {
