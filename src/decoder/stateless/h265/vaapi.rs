@@ -13,7 +13,6 @@ use libva::IQMatrix;
 use libva::IQMatrixBufferHEVC;
 use libva::Picture as VaPicture;
 use libva::PictureHEVC;
-use libva::PictureNew;
 use libva::PictureParameterBufferHEVC;
 use libva::SliceParameter;
 use libva::SliceParameterBufferHEVC;
@@ -21,7 +20,6 @@ use libva::SliceParameterBufferHEVCRext;
 use libva::SurfaceMemoryDescriptor;
 
 use crate::backend::vaapi::DecodedHandle as VADecodedHandle;
-use crate::backend::vaapi::PooledSurface;
 use crate::backend::vaapi::VaStreamInfo;
 use crate::backend::vaapi::VaapiBackend;
 use crate::codec::h265::dpb::Dpb;
@@ -33,12 +31,13 @@ use crate::codec::h265::parser::Sps;
 use crate::codec::h265::picture::PictureData;
 use crate::codec::h265::picture::Reference;
 use crate::decoder::stateless::h265::clip3;
-use crate::decoder::stateless::h265::Decoder;
 use crate::decoder::stateless::h265::RefPicListEntry;
 use crate::decoder::stateless::h265::RefPicSet;
 use crate::decoder::stateless::h265::StatelessH265DecoderBackend;
+use crate::decoder::stateless::h265::H265;
 use crate::decoder::stateless::StatelessBackendError;
 use crate::decoder::stateless::StatelessBackendResult;
+use crate::decoder::stateless::StatelessDecoder;
 use crate::decoder::stateless::StatelessDecoderBackend;
 use crate::decoder::BlockingMode;
 
@@ -49,7 +48,7 @@ enum ScalingListType {
 }
 
 #[derive(Default)]
-struct BackendData {
+pub struct BackendData {
     // We are always one slice behind, so that we can mark the last one in
     // submit_picture()
     last_slice: Option<(
@@ -111,7 +110,6 @@ impl VaStreamInfo for &Sps {
     fn visible_rect(&self) -> ((u32, u32), (u32, u32)) {
         let rect = self.visible_rectangle();
 
-        // ((rect.min.x, rect.min.y), (rect.max.x, rect.max.y))
         ((rect.min.x, rect.min.y), (rect.max.x, rect.max.y))
     }
 }
@@ -586,7 +584,7 @@ impl<M: SurfaceMemoryDescriptor + 'static> StatelessH265DecoderBackend
         ))
     }
 
-    fn handle_picture(
+    fn begin_picture(
         &mut self,
         picture: &mut Self::Picture,
         picture_data: &PictureData,
@@ -812,15 +810,14 @@ impl<M: SurfaceMemoryDescriptor + 'static> StatelessH265DecoderBackend
     }
 }
 
-impl<M: SurfaceMemoryDescriptor + 'static>
-    Decoder<VADecodedHandle<M>, VaPicture<PictureNew, PooledSurface<M>>>
-{
+impl<M: SurfaceMemoryDescriptor + 'static> StatelessDecoder<H265, VaapiBackend<BackendData, M>> {
     // Creates a new instance of the decoder using the VAAPI backend.
-    pub fn new_vaapi(display: Rc<Display>, blocking_mode: BlockingMode) -> anyhow::Result<Self> {
-        Self::new(
-            Box::new(VaapiBackend::<BackendData, M>::new(display)),
-            blocking_mode,
-        )
+    pub fn new_vaapi<S>(display: Rc<Display>, blocking_mode: BlockingMode) -> Self
+    where
+        M: From<S>,
+        S: From<M>,
+    {
+        Self::new(VaapiBackend::<BackendData, M>::new(display), blocking_mode)
     }
 }
 
@@ -828,9 +825,10 @@ impl<M: SurfaceMemoryDescriptor + 'static>
 mod tests {
     use libva::Display;
 
-    use crate::decoder::stateless::h265::Decoder;
+    use crate::decoder::stateless::h265::H265;
     use crate::decoder::stateless::tests::test_decode_stream;
     use crate::decoder::stateless::tests::TestStream;
+    use crate::decoder::stateless::StatelessDecoder;
     use crate::decoder::BlockingMode;
     use crate::utils::simple_playback_loop;
     use crate::utils::simple_playback_loop_owned_surfaces;
@@ -844,7 +842,7 @@ mod tests {
         blocking_mode: BlockingMode,
     ) {
         let display = Display::open().unwrap();
-        let decoder = Decoder::new_vaapi(display, blocking_mode).unwrap();
+        let decoder = StatelessDecoder::<H265, _>::new_vaapi::<()>(display, blocking_mode);
 
         test_decode_stream(
             |d, s, f| {

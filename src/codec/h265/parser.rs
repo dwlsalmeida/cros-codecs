@@ -182,7 +182,7 @@ pub struct NaluHeader {
 }
 
 impl NaluHeader {
-    pub fn type_(&self) -> NaluType {
+    pub fn nalu_type(&self) -> NaluType {
         self.type_
     }
 
@@ -5242,7 +5242,7 @@ impl Parser {
             ..Default::default()
         };
 
-        if nalu.header().type_().is_irap() {
+        if nalu.header().nalu_type().is_irap() {
             hdr.no_output_of_prior_pics_flag = r.read_bit()?;
         }
 
@@ -5605,7 +5605,7 @@ impl Parser {
 
         log::debug!(
             "Parsed slice {:?}, NAL size was {}",
-            nalu_header.type_(),
+            nalu_header.nalu_type(),
             nalu.size()
         );
 

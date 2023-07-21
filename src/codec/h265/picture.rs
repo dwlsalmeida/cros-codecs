@@ -56,7 +56,7 @@ impl PictureData {
         _timestamp: u64,
     ) -> Self {
         let hdr = slice.header();
-        let nalu_type = slice.nalu().header().type_();
+        let nalu_type = slice.nalu().header().nalu_type();
         let is_irap = nalu_type.is_irap();
 
         // We assume HandleCraAsBlafFLag == 0, as it is only set through
@@ -76,7 +76,8 @@ impl PictureData {
             || (nalu_type.is_cra() && first_picture_in_bitstream)
             || first_picture_after_eos;
 
-        let pic_output_flag = if slice.nalu().header().type_().is_rasl() && no_rasl_output_flag {
+        let pic_output_flag = if slice.nalu().header().nalu_type().is_rasl() && no_rasl_output_flag
+        {
             false
         } else {
             hdr.pic_output_flag()

@@ -110,7 +110,7 @@ impl<T: AsRef<[u8]>> H265AccessUnitParser<T> {
     /// Whether this is a slice type.
     fn is_slice(nalu: &H265Nalu<T>) -> bool {
         matches!(
-            nalu.header().type_(),
+            nalu.header().nalu_type(),
             H265NaluType::BlaWLp
                 | H265NaluType::BlaWRadl
                 | H265NaluType::BlaNLp
@@ -133,7 +133,7 @@ impl<T: AsRef<[u8]>> H265AccessUnitParser<T> {
     /// Whether this is a delimiter, which would automatically start a new AU.
     fn is_delimiter(nalu: &H265Nalu<T>) -> bool {
         matches!(
-            nalu.header().type_(),
+            nalu.header().nalu_type(),
             H265NaluType::AudNut | H265NaluType::EobNut | H265NaluType::EosNut
         )
     }
@@ -146,7 +146,7 @@ impl<T: AsRef<[u8]>> H265AccessUnitParser<T> {
     /// firstVclNalUnitInAu, if any, specifies the start of a new access unit:
     fn specifies_new_au(nalu: &H265Nalu<T>) -> bool {
         matches!(
-            nalu.header().type_(),
+            nalu.header().nalu_type(),
             H265NaluType::PrefixSeiNut
                 | H265NaluType::VpsNut
                 | H265NaluType::SpsNut
@@ -185,7 +185,7 @@ impl<T: AsRef<[u8]>> H265AccessUnitParser<T> {
         log::debug!("Collecting access unit: (Nalu, Size): {:?}", {
             au.nalus
                 .iter()
-                .map(|nalu| (nalu.header().type_(), nalu.size()))
+                .map(|nalu| (nalu.header().nalu_type(), nalu.size()))
                 .collect::<Vec<_>>()
         });
 
@@ -322,15 +322,21 @@ where
     };
 
     for (frame_num, packet) in stream_iter.enumerate() {
+        let mut bitstream = packet.as_ref();
         loop {
-            match decoder.decode(frame_num as u64, packet.as_ref()) {
-                Ok(_) => {
+            match decoder.decode(frame_num as u64, bitstream) {
+                Ok(bytes_decoded) => {
+                    bitstream = &bitstream[bytes_decoded..];
+
                     if blocking_mode == BlockingMode::Blocking {
                         check_events(decoder)?;
                     }
-                    // Break the loop so we can process the next NAL if we sent the current one
-                    // successfully.
-                    break;
+
+                    if bitstream.is_empty() {
+                        // Break the loop so we can process the next NAL if we sent the current one
+                        // successfully.
+                        break;
+                    }
                 }
                 Err(DecodeError::CheckEvents) | Err(DecodeError::NotEnoughOutputBuffers(_)) => {
                     check_events(decoder)?
